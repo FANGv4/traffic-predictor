@@ -12,3 +12,6 @@ gatherUsageStats = false
 [server]
 headless = true
 
+[client]
+showSidebarNavigation = false
+
