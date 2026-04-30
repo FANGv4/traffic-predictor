@@ -26,9 +26,9 @@ def render_top_nav(active: str) -> None:
         with c1:
             st.page_link("app.py", label="首页", icon="🏠", use_container_width=True, width="stretch")
         with c2:
-            st.page_link("pages/1_预测器.py", label="预测器", icon="📈", use_container_width=True, width="stretch")
+            st.page_link("pages/1_predictor.py", label="预测器", icon="📈", use_container_width=True, width="stretch")
         with c3:
-            st.page_link("pages/2_方法与指标.py", label="方法与指标", icon="🧪", use_container_width=True, width="stretch")
+            st.page_link("pages/2_method.py", label="方法与指标", icon="🧪", use_container_width=True, width="stretch")
     with right:
         label = {
             "home": "首页",
