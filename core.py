@@ -36,6 +36,12 @@ class ParsedInput:
     dates: Optional[pd.Series]
 
 
+@dataclass(frozen=True)
+class CsvParseMeta:
+    value_col: str
+    date_col: Optional[str]
+
+
 def parse_numeric_series(text: str) -> np.ndarray:
     cleaned = text.replace("，", ",").replace("；", ",")
     parts = re.split(r"[\s,]+", cleaned.strip())
@@ -56,38 +62,142 @@ def infer_granularity_from_dates(dates: pd.Series) -> Granularity:
     return "daily" if median_days <= 2.0 else "weekly"
 
 
-def read_csv_series(file) -> Tuple[np.ndarray, Optional[pd.Series]]:
-    df = pd.read_csv(file)
+def read_csv_series(file) -> Tuple[np.ndarray, Optional[pd.Series], CsvParseMeta]:
+    import io
+    from pandas.errors import EmptyDataError
+
+    content: bytes | None = None
+    if isinstance(file, (bytes, bytearray)):
+        content = bytes(file)
+    elif hasattr(file, "getvalue"):
+        try:
+            content = file.getvalue()
+        except Exception:
+            content = None
+    if content is None and hasattr(file, "read"):
+        try:
+            if hasattr(file, "seek"):
+                file.seek(0)
+            content = file.read()
+        except Exception:
+            content = None
+
+    try:
+        if content is not None:
+            df = pd.read_csv(io.BytesIO(content), encoding="utf-8-sig", sep=None, engine="python")
+        else:
+            df = pd.read_csv(file, encoding="utf-8-sig", sep=None, engine="python")
+    except EmptyDataError:
+        raise ValueError("CSV 无法解析：文件为空或格式不正确（请确认是标准 CSV，而不是空文件/加密文件/错误分隔符）")
     if df.empty:
         raise ValueError("CSV 为空")
 
-    lower_cols = {c.lower(): c for c in df.columns}
-    date_col = lower_cols.get("date") or lower_cols.get("ds")
-    value_col = lower_cols.get("value") or lower_cols.get("y")
+    df = df.dropna(axis=1, how="all")
+    if df.empty:
+        raise ValueError("CSV 为空")
 
-    if date_col and value_col:
-        dates = pd.to_datetime(df[date_col], errors="coerce")
-        values = pd.to_numeric(df[value_col], errors="coerce")
-        mask = dates.notna() & values.notna()
-        dates = dates[mask]
-        values = values[mask]
-        if values.empty:
+    def _name_score(col: str) -> float:
+        s = str(col).strip().lower()
+        score = 0.0
+        for kw in [
+            "value",
+            "y",
+            "sales",
+            "traffic",
+            "count",
+            "num",
+            "people",
+            "visitor",
+            "visitors",
+            "uv",
+            "pv",
+            "客流",
+            "人流",
+            "人数",
+            "销量",
+            "销售",
+            "订单",
+            "访客",
+        ]:
+            if kw in s:
+                score += 1.2
+        for bad in ["id", "uuid", "code", "编号", "代码", "店id", "merchantid", "shopid"]:
+            if bad in s:
+                score -= 1.5
+        return score
+
+    def _date_score(col: str) -> float:
+        s = str(col).strip().lower()
+        if s in {"date", "ds", "day", "time", "datetime", "日期", "时间"}:
+            return 2.0
+        if any(k in s for k in ["date", "day", "time", "日期", "时间", "周", "month", "year"]):
+            return 1.0
+        return 0.0
+
+    n = len(df)
+    date_candidates: list[tuple[float, str, pd.Series]] = []
+    numeric_candidates: list[tuple[float, str, pd.Series]] = []
+
+    for col in df.columns:
+        s_date = pd.to_datetime(df[col], errors="coerce")
+        valid_date = int(s_date.notna().sum())
+        if valid_date >= max(3, int(0.6 * n)):
+            date_candidates.append((valid_date + 10.0 * _date_score(col), str(col), s_date))
+
+        s_num = pd.to_numeric(df[col], errors="coerce")
+        valid_num = int(s_num.notna().sum())
+        if valid_num >= max(5, int(0.6 * n)):
+            std = float(np.nanstd(s_num.to_numpy(dtype=float)))
+            numeric_candidates.append(
+                (valid_num + 0.05 * std + 10.0 * _name_score(col), str(col), s_num)
+            )
+
+    if not numeric_candidates:
+        if df.shape[1] == 1:
+            col = str(df.columns[0])
+            s_num = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+            s_num = s_num.dropna()
+            if s_num.empty:
+                raise ValueError("无法在 CSV 中找到数值列：请确保至少有一列是数字")
+            return s_num.to_numpy(dtype=float), None, CsvParseMeta(value_col=col, date_col=None)
+        raise ValueError("无法在 CSV 中找到数值列：请确保至少有一列是数字")
+
+    numeric_candidates.sort(key=lambda x: x[0], reverse=True)
+    value_col, values_s = numeric_candidates[0][1], numeric_candidates[0][2]
+
+    date_col: Optional[str] = None
+    dates_s: Optional[pd.Series] = None
+    if date_candidates:
+        date_candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, cand_col, cand_series in date_candidates:
+            if cand_col != value_col:
+                date_col = cand_col
+                dates_s = cand_series
+                break
+
+    if dates_s is not None:
+        mask = dates_s.notna() & values_s.notna()
+        dates_s = dates_s[mask]
+        values_s = values_s[mask]
+        if values_s.empty:
             raise ValueError("未能从 CSV 中解析出有效数值")
-        order = np.argsort(dates.to_numpy())
-        return values.to_numpy(dtype=float)[order], dates.iloc[order]
+        dates_s = pd.to_datetime(dates_s, errors="coerce")
+        mask2 = dates_s.notna() & values_s.notna()
+        dates_s = dates_s[mask2]
+        values_s = values_s[mask2]
+        if values_s.empty:
+            raise ValueError("未能从 CSV 中解析出有效数值")
+        order = np.argsort(dates_s.to_numpy())
+        return (
+            values_s.to_numpy(dtype=float)[order],
+            pd.Series(dates_s.iloc[order]),
+            CsvParseMeta(value_col=value_col, date_col=date_col),
+        )
 
-    if df.shape[1] < 2:
-        raise ValueError("CSV 至少需要两列（日期 + 数值）")
-
-    dates = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-    values = pd.to_numeric(df.iloc[:, 1], errors="coerce")
-    mask = dates.notna() & values.notna()
-    dates = dates[mask]
-    values = values[mask]
-    if values.empty:
-        raise ValueError("未能从 CSV 的前两列解析出有效数值")
-    order = np.argsort(dates.to_numpy())
-    return values.to_numpy(dtype=float)[order], dates.iloc[order]
+    values_s = values_s.dropna()
+    if values_s.empty:
+        raise ValueError("未能从 CSV 中解析出有效数值")
+    return values_s.to_numpy(dtype=float), None, CsvParseMeta(value_col=value_col, date_col=None)
 
 
 def make_template_csv(granularity: Granularity) -> bytes:
